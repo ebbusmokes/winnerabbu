@@ -1,188 +1,137 @@
 # -*- coding: utf-8 -*-
-import asyncio, os, random, requests
+import asyncio
+import os
+import random
+import requests
 from datetime import datetime
-from urllib.parse import unquote
-from playwright.async_api import async_playwright
+from instagrapi import Client
+from instagrapi.exceptions import LoginRequired, PleaseWaitFewMinutes, ClientError
 
 # ================== TELEGRAM ==================
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+TG_CHAT = os.getenv("TG_CHAT_ID")
 
-BOT_RUNNING = True
-
-def tg(msg):
-    if not TG_TOKEN or not TG_CHAT_ID:
+def tg(msg: str):
+    if not TG_TOKEN or not TG_CHAT:
         return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg},
+            json={"chat_id": TG_CHAT, "text": msg},
             timeout=5
         )
     except:
         pass
 
-async def telegram_listener():
-    global BOT_RUNNING
-    offset = 0
-    tg("🤖 Bot ONLINE\nCommands: /start /stop /status")
-
-    while True:
-        try:
-            r = requests.get(
-                f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
-                params={"offset": offset},
-                timeout=10
-            ).json()
-
-            for u in r.get("result", []):
-                offset = u["update_id"] + 1
-                msg = u.get("message", {})
-                chat_id = msg.get("chat", {}).get("id")
-                text = msg.get("text", "")
-
-                if str(chat_id) != str(TG_CHAT_ID):
-                    continue
-
-                if text == "/start":
-                    BOT_RUNNING = True
-                    tg("▶️ BOT STARTED")
-
-                elif text == "/stop":
-                    BOT_RUNNING = False
-                    tg("⏸ BOT STOPPED")
-
-                elif text == "/status":
-                    tg(
-                        f"📊 STATUS\n"
-                        f"Running: {BOT_RUNNING}\n"
-                        f"✅ Success: {SUCCESS}\n"
-                        f"❌ Fail: {FAIL}"
-                    )
-        except:
-            pass
-
-        await asyncio.sleep(3)
-
-# ================== LOGGING ==================
-SUCCESS = 0
-FAIL = 0
-LOCK = asyncio.Lock()
-
-def log_event(ok, acc, tid, err=None):
-    global SUCCESS, FAIL
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if ok:
-        SUCCESS += 1
-        msg = f"[{now}] ✅ {acc} sent to {tid}"
-    else:
-        FAIL += 1
-        msg = f"[{now}] ❌ {acc} FAILED to {tid} ({err})"
-
-    print(msg)
-    tg(msg)
-
-# ================== CONFIG ==================
-MIN_DELAY = 40
-MAX_DELAY = 45
-MESSAGES_PER_GC = 1
-RESTART_AFTER = 60
-
-# ================== LOAD ACCOUNTS ==================
-# ENV FORMAT:
-# ACCOUNTS = acc1,acc2
-# ACC1_SESSION=xxxx
-# ACC1_THREADS=url1,url2
-# ACC1_MESSAGE=hello
-
-account_names = os.getenv("ACCOUNTS", "").split(",")
+# ================== LOAD CONFIG ==================
+MESSAGES = os.getenv("MESSAGES", "").split("|")
+ACCOUNT_NAMES = os.getenv("ACCOUNTS", "").split(",")
 
 ACCOUNTS = []
-for name in account_names:
-    name = name.strip()
+for name in ACCOUNT_NAMES:
+    name = name.strip().upper()
     if not name:
         continue
-    ACCOUNTS.append({
-        "name": name,
-        "session": unquote(os.getenv(f"{name.upper()}_SESSION")),
-        "threads": os.getenv(f"{name.upper()}_THREADS").split(","),
-        "message": os.getenv(f"{name.upper()}_MESSAGE")
-    })
+    session = os.getenv(f"{name}_SESSION")
+    gcs = [gc.strip() for gc in os.getenv(f"{name}_GCS", "").split(",") if gc.strip()]
+    if session and gcs:
+        ACCOUNTS.append({
+            "name": name,
+            "session": session,
+            "gcs": gcs  # List of direct thread URLs
+        })
 
-if not ACCOUNTS:
-    raise RuntimeError("No accounts configured")
+if not ACCOUNTS or not MESSAGES:
+    raise RuntimeError("Missing ENV config: ACCOUNTS, MESSAGES, and per-account _SESSION and _GCS required")
 
-# ================== WORKER ==================
-async def worker(acc):
-    sent = 0
+num_accounts = len(ACCOUNTS)
+
+# Calculate shorter delay per message so each account gets ~40-45s effective delay
+base_delay_min = 40 / num_accounts
+base_delay_max = 45 / num_accounts
+# Minimum reasonable delay to avoid instant bans (adjust if needed)
+short_delay_min = max(8, base_delay_min - 2)  # e.g., for 4 acc: ~9-13s
+short_delay_max = base_delay_max + 2
+
+# ================== MAIN LOOP ==================
+async def main():
+    tg("🤖 Bot started (sequential mode)")
+    print("🤖 Bot started (sequential mode)")
+
+    cl = Client()
+    cl.delay_range = [1, 5]  # Small built-in delays for safety
+
+    current_acc_index = 0
 
     while True:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context()
+        acc = ACCOUNTS[current_acc_index]
 
-            await context.add_cookies([{
-                "name": "sessionid",
-                "value": acc["session"],
-                "domain": ".instagram.com",
-                "path": "/",
-                "secure": True,
-                "httpOnly": True
-            }])
+        try:
+            # Switch session: set new sessionid (this "logs out" old and "logs in" new)
+            cl.login_by_sessionid(acc["session"])
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log = f"✅ {now} | Switched to {acc['name']}"
+            print(log)
+            tg(log)
 
-            page = await context.new_page()
+            # Send to all group chats for this account
+            for gc_url in acc["gcs"]:
+                try:
+                    thread_id = gc_url.split("/direct/t/")[-1].split("/")[0].strip()
 
-            try:
-                await page.goto(acc["threads"][0], timeout=60000)
-                await page.locator(
-                    'div[role="textbox"][contenteditable="true"]'
-                ).wait_for(timeout=30000)
+                    msg = random.choice(MESSAGES)
 
-                cycle = 0
-                while cycle < RESTART_AFTER:
-                    if not BOT_RUNNING:
-                        await asyncio.sleep(5)
-                        continue
+                    cl.direct_send(text=msg, thread_ids=[thread_id])
 
-                    for tid in acc["threads"]:
-                        if cycle >= RESTART_AFTER:
-                            break
+                    sent = 1
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    log = f"✅ {now} | {acc['name']} | SENT | Thread: {thread_id}"
+                    print(log)
+                    tg(log)
 
-                        try:
-                            await page.goto(tid, timeout=30000)
-                            await page.locator(
-                                'div[role="textbox"][contenteditable="true"]'
-                            ).wait_for(timeout=30000)
+                    # Short delay after each individual message
+                    await asyncio.sleep(random.uniform(short_delay_min, short_delay_max))
 
-                            await page.evaluate(
-                                """(t)=>{
-                                    const e=document.querySelector('div[role="textbox"][contenteditable="true"]');
-                                    if(e){e.focus();document.execCommand('insertText',false,t);}
-                                }""",
-                                acc["message"]
-                            )
+                except PleaseWaitFewMinutes:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    err = f"⚠️ {now} | {acc['name']} | RATE LIMIT | Waiting 10-15 min"
+                    print(err)
+                    tg(err)
+                    await asyncio.sleep(random.uniform(600, 900))
+                except LoginRequired:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    err = f"❌ {now} | {acc['name']} | SESSION EXPIRED"
+                    print(err)
+                    tg(err)
+                    # Skip to next account or stop if critical
+                    break
+                except ClientError as e:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    err = f"⚠️ {now} | {acc['name']} | CLIENT ERROR | {e}"
+                    print(err)
+                    tg(err)
+                    await asyncio.sleep(60)
+                except Exception as e:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    err = f"❌ {now} | {acc['name']} | FAIL | {e}"
+                    print(err)
+                    tg(err)
+                    await asyncio.sleep(random.uniform(30, 60))
 
-                            await page.keyboard.press("Enter")
-                            log_event(True, acc["name"], tid)
+            # After finishing all GCs for this account, move to next
+            current_acc_index = (current_acc_index + 1) % num_accounts
 
-                        except Exception as e:
-                            log_event(False, acc["name"], tid, str(e))
+            # Optional extra small delay between full account cycles
+            # await asyncio.sleep(random.uniform(5, 10))
 
-                        sent += 1
-                        cycle += 1
-                        await asyncio.sleep(random.uniform(0.3, 0.6))
+        except Exception as e:
+            # Fallback error for session switch
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            err = f"❌ {now} | Switch failed for {acc['name']} | {e}"
+            print(err)
+            tg(err)
+            current_acc_index = (current_acc_index + 1) % num_accounts
+            await asyncio.sleep(30)
 
-            finally:
-                await context.close()
-                await browser.close()
-
-            await asyncio.sleep(random.uniform(2, 4))
-
-# ================== MAIN ==================
-async def main():
-    asyncio.create_task(telegram_listener())
-    tasks = [asyncio.create_task(worker(acc)) for acc in ACCOUNTS]
-    await asyncio.gather(*tasks)
-
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
