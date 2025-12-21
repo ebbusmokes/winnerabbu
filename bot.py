@@ -106,9 +106,9 @@ if not ACCOUNTS:
 # ================= LOGIN / REFRESH =================
 def login_account(acc):
     cl = Client()
-    cl.set_settings({"sessionid": acc["sessionid"]})
-    cl.login_by_sessionid(acc["sessionid"])
-    tg_log(f" Logged in {acc['name']}")
+    cl.set_cookie({"sessionid": acc["sessionid"]})
+    cl.get_timeline_feed()  # forces validation without broadcast fetch
+    tg_log(f"✅ Logged in {acc['name']}")
     return cl
 
 def safe_send(cl, acc, tid):
@@ -162,5 +162,6 @@ while True:
                 tg_log(f"[{now}]  {acc['name']} skipped")
 
             time.sleep(INTERNAL_GC_DELAY)
+
 
         time.sleep(gap)
