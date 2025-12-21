@@ -1,32 +1,16 @@
-import time
-import random
-import os
-import requests
+# -*- coding: utf-8 -*-
+import asyncio, os, random, requests
 from datetime import datetime
-from instagrapi import Client
-from flask import Flask
-from threading import Thread
+from urllib.parse import unquote
+from playwright.async_api import async_playwright
 
-# ================= KEEP ALIVE (Render + UptimeRobot) =================
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Bot is alive"
-
-def run_web():
-    app.run(host="0.0.0.0", port=10000)
-
-Thread(target=run_web, daemon=True).start()
-
-# ================= TELEGRAM =================
+# ================== TELEGRAM ==================
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
 BOT_RUNNING = True
-LAST_UPDATE_ID = 0
 
-def tg_log(msg):
+def tg(msg):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     try:
@@ -38,54 +22,80 @@ def tg_log(msg):
     except:
         pass
 
-def telegram_listener():
-    global BOT_RUNNING, LAST_UPDATE_ID
-    tg_log(" Bot online. Commands: /startbot /stopbot /status")
+async def telegram_listener():
+    global BOT_RUNNING
+    offset = 0
+    tg("🤖 Bot ONLINE\nCommands: /start /stop /status")
 
     while True:
         try:
             r = requests.get(
                 f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates",
+                params={"offset": offset},
                 timeout=10
             ).json()
 
             for u in r.get("result", []):
-                uid = u["update_id"]
-                if uid <= LAST_UPDATE_ID:
-                    continue
-                LAST_UPDATE_ID = uid
-
+                offset = u["update_id"] + 1
                 msg = u.get("message", {})
                 chat_id = msg.get("chat", {}).get("id")
                 text = msg.get("text", "")
 
-                #  LOCK TO OWNER ONLY
                 if str(chat_id) != str(TG_CHAT_ID):
                     continue
 
-                if text == "/startbot":
+                if text == "/start":
                     BOT_RUNNING = True
-                    tg_log(" Bot STARTED")
+                    tg("▶️ BOT STARTED")
 
-                elif text == "/stopbot":
+                elif text == "/stop":
                     BOT_RUNNING = False
-                    tg_log(" Bot STOPPED")
+                    tg("⏸ BOT STOPPED")
 
                 elif text == "/status":
-                    tg_log(" Status: RUNNING " if BOT_RUNNING else " Status: STOPPED ")
+                    tg(
+                        f"📊 STATUS\n"
+                        f"Running: {BOT_RUNNING}\n"
+                        f"✅ Success: {SUCCESS}\n"
+                        f"❌ Fail: {FAIL}"
+                    )
         except:
             pass
 
-        time.sleep(3)
+        await asyncio.sleep(3)
 
-Thread(target=telegram_listener, daemon=True).start()
+# ================== LOGGING ==================
+SUCCESS = 0
+FAIL = 0
+LOCK = asyncio.Lock()
 
-# ================= SETTINGS =================
-MIN_INTERVAL = 40
-MAX_INTERVAL = 45
-INTERNAL_GC_DELAY = 3  # seconds between GCs
+def log_event(ok, acc, tid, err=None):
+    global SUCCESS, FAIL
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ================= LOAD ACCOUNTS FROM ENV =================
+    if ok:
+        SUCCESS += 1
+        msg = f"[{now}] ✅ {acc} sent to {tid}"
+    else:
+        FAIL += 1
+        msg = f"[{now}] ❌ {acc} FAILED to {tid} ({err})"
+
+    print(msg)
+    tg(msg)
+
+# ================== CONFIG ==================
+MIN_DELAY = 40
+MAX_DELAY = 45
+MESSAGES_PER_GC = 1
+RESTART_AFTER = 60
+
+# ================== LOAD ACCOUNTS ==================
+# ENV FORMAT:
+# ACCOUNTS = acc1,acc2
+# ACC1_SESSION=xxxx
+# ACC1_THREADS=url1,url2
+# ACC1_MESSAGE=hello
+
 account_names = os.getenv("ACCOUNTS", "").split(",")
 
 ACCOUNTS = []
@@ -95,73 +105,84 @@ for name in account_names:
         continue
     ACCOUNTS.append({
         "name": name,
-        "sessionid": os.getenv(f"{name.upper()}_SESSION"),
-        "threads": os.getenv(f"{name.upper()}_THREADS", "").split(","),
-        "message": os.getenv(f"{name.upper()}_MESSAGE", "")
+        "session": unquote(os.getenv(f"{name.upper()}_SESSION")),
+        "threads": os.getenv(f"{name.upper()}_THREADS").split(","),
+        "message": os.getenv(f"{name.upper()}_MESSAGE")
     })
 
 if not ACCOUNTS:
     raise RuntimeError("No accounts configured")
 
-# ================= LOGIN / REFRESH =================
-def login_account(acc):
-    cl = Client()
-    cl.set_cookie({"sessionid": acc["sessionid"]})
-    cl.get_timeline_feed()  # forces validation without broadcast fetch
-    tg_log(f"✅ Logged in {acc['name']}")
-    return cl
+# ================== WORKER ==================
+async def worker(acc):
+    sent = 0
 
-def safe_send(cl, acc, tid):
-    try:
-        cl.direct_send(acc["message"], thread_ids=[tid])
-        return cl
-    except Exception as e:
-        tg_log(f" {acc['name']} failed  refreshing | {e}")
-        try:
-            cl.logout()
-        except:
-            pass
-        try:
-            new_cl = login_account(acc)
-            new_cl.direct_send(acc["message"], thread_ids=[tid])
-            tg_log(f" {acc['name']} refreshed & sent")
-            return new_cl
-        except Exception as e:
-            tg_log(f" {acc['name']} refresh failed | {e}")
-            return None
+    while True:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
 
-# ================= INITIAL LOGIN =================
-clients = [login_account(acc) for acc in ACCOUNTS]
-tg_log(" Bot started")
+            await context.add_cookies([{
+                "name": "sessionid",
+                "value": acc["session"],
+                "domain": ".instagram.com",
+                "path": "/",
+                "secure": True,
+                "httpOnly": True
+            }])
 
-# ================= MAIN LOOP =================
-while True:
-    if not BOT_RUNNING:
-        time.sleep(5)
-        continue
+            page = await context.new_page()
 
-    interval = random.randint(MIN_INTERVAL, MAX_INTERVAL)
-    gap = interval / len(ACCOUNTS)
+            try:
+                await page.goto(acc["threads"][0], timeout=60000)
+                await page.locator(
+                    'div[role="textbox"][contenteditable="true"]'
+                ).wait_for(timeout=30000)
 
-    for i, acc in enumerate(ACCOUNTS):
-        cl = clients[i]
-        now = datetime.now().strftime("%H:%M:%S")
+                cycle = 0
+                while cycle < RESTART_AFTER:
+                    if not BOT_RUNNING:
+                        await asyncio.sleep(5)
+                        continue
 
-        for tid in acc["threads"]:
-            tid = tid.strip()
-            if not tid:
-                continue
+                    for tid in acc["threads"]:
+                        if cycle >= RESTART_AFTER:
+                            break
 
-            result = safe_send(cl, acc, tid)
-            if result:
-                clients[i] = result
-                msg = f"[{now}]  {acc['name']}  {tid}"
-                print(msg)
-                tg_log(msg)
-            else:
-                tg_log(f"[{now}]  {acc['name']} skipped")
+                        try:
+                            await page.goto(tid, timeout=30000)
+                            await page.locator(
+                                'div[role="textbox"][contenteditable="true"]'
+                            ).wait_for(timeout=30000)
 
-            time.sleep(INTERNAL_GC_DELAY)
+                            await page.evaluate(
+                                """(t)=>{
+                                    const e=document.querySelector('div[role="textbox"][contenteditable="true"]');
+                                    if(e){e.focus();document.execCommand('insertText',false,t);}
+                                }""",
+                                acc["message"]
+                            )
 
+                            await page.keyboard.press("Enter")
+                            log_event(True, acc["name"], tid)
 
-        time.sleep(gap)
+                        except Exception as e:
+                            log_event(False, acc["name"], tid, str(e))
+
+                        sent += 1
+                        cycle += 1
+                        await asyncio.sleep(random.uniform(0.3, 0.6))
+
+            finally:
+                await context.close()
+                await browser.close()
+
+            await asyncio.sleep(random.uniform(2, 4))
+
+# ================== MAIN ==================
+async def main():
+    asyncio.create_task(telegram_listener())
+    tasks = [asyncio.create_task(worker(acc)) for acc in ACCOUNTS]
+    await asyncio.gather(*tasks)
+
+asyncio.run(main())
